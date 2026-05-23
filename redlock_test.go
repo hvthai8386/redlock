@@ -50,7 +50,7 @@ func setLockValue(t *testing.T, client *redis.Client, key, value string) {
 func TestNewRedlockSetsDefaults(t *testing.T) {
 	t.Parallel()
 
-	clients := []*redis.Client{{}, {}, {}}
+	clients := []*redis.Client{&redis.Client{}, &redis.Client{}, &redis.Client{}}
 	r := NewRedlock(clients)
 
 	if len(r.clients) != len(clients) {
