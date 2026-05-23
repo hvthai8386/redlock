@@ -14,14 +14,30 @@ import (
 var (
 	ErrLockNotAcquired = errors.New("failed to acquire lock")
 	ErrLockNotHeld     = errors.New("lock not held or expired")
+	ErrInvalidTTL      = errors.New("ttl must be greater than zero")
 )
 
 // Lock represents an acquired distributed lock
 type Lock struct {
+	mu       sync.Mutex
 	key      string
 	value    string
 	expiry   time.Time
 	managers []*redis.Client
+}
+
+func (l *Lock) expired() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return time.Now().After(l.expiry)
+}
+
+func (l *Lock) setExpiry(expiry time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.expiry = expiry
 }
 
 // Redlock implements the Redlock distributed locking algorithm
@@ -56,8 +72,25 @@ func generateValue() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+func validateTTL(ttl time.Duration) error {
+	if ttl <= 0 {
+		return ErrInvalidTTL
+	}
+	return nil
+}
+
+func (r *Redlock) validityDuration(start time.Time, ttl time.Duration) time.Duration {
+	elapsed := time.Since(start)
+	drift := time.Duration(float64(ttl) * r.driftFactor)
+	return ttl - elapsed - drift
+}
+
 // Acquire tries to obtain a distributed lock with the given TTL
 func (r *Redlock) Acquire(ctx context.Context, key string, ttl time.Duration) (*Lock, error) {
+	if err := validateTTL(ttl); err != nil {
+		return nil, err
+	}
+
 	value, err := generateValue()
 	if err != nil {
 		return nil, err
@@ -112,9 +145,7 @@ func (r *Redlock) tryAcquire(ctx context.Context, key, value string, ttl time.Du
 	}
 
 	// Calculate elapsed time and check if lock is still valid
-	elapsed := time.Since(startTime)
-	drift := time.Duration(float64(ttl) * r.driftFactor)
-	validityTime := ttl - elapsed - drift
+	validityTime := r.validityDuration(startTime, ttl)
 
 	// Check if we achieved quorum and lock is still valid
 	if successCount >= r.quorum && validityTime > 0 {
@@ -127,7 +158,7 @@ func (r *Redlock) tryAcquire(ctx context.Context, key, value string, ttl time.Du
 	}
 
 	// Failed to acquire quorum - release any locks we did get
-	r.releaseAll(ctx, key, value)
+	_ = r.releaseAll(ctx, key, value)
 	return nil, ErrLockNotAcquired
 }
 
@@ -145,12 +176,14 @@ func (r *Redlock) Release(ctx context.Context, lock *Lock) error {
 	if lock == nil {
 		return ErrLockNotHeld
 	}
-	r.releaseAll(ctx, lock.key, lock.value)
+	if r.releaseAll(ctx, lock.key, lock.value) < r.quorum {
+		return ErrLockNotHeld
+	}
 	return nil
 }
 
 // releaseAll releases the lock from all Redis instances
-func (r *Redlock) releaseAll(ctx context.Context, key, value string) {
+func (r *Redlock) releaseAll(ctx context.Context, key, value string) int {
 	// Lua script ensures we only delete if we hold the lock
 	// This prevents deleting a lock that was acquired by another process
 	script := `
@@ -161,22 +194,34 @@ func (r *Redlock) releaseAll(ctx context.Context, key, value string) {
         end
     `
 
+	successCount := 0
+	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, client := range r.clients {
 		wg.Add(1)
 		go func(c *redis.Client) {
 			defer wg.Done()
-			c.Eval(ctx, script, []string{key}, value)
+			result, err := c.Eval(ctx, script, []string{key}, value).Int()
+			if err == nil && result == 1 {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
 		}(client)
 	}
 	wg.Wait()
+	return successCount
 }
 
 // Extend attempts to extend the lock's TTL
 func (r *Redlock) Extend(ctx context.Context, lock *Lock, ttl time.Duration) error {
-	if lock == nil || time.Now().After(lock.expiry) {
+	if err := validateTTL(ttl); err != nil {
+		return err
+	}
+	if lock == nil || lock.expired() {
 		return ErrLockNotHeld
 	}
+	startTime := time.Now()
 
 	// Lua script to extend only if we still hold the lock
 	script := `
@@ -206,8 +251,9 @@ func (r *Redlock) Extend(ctx context.Context, lock *Lock, ttl time.Duration) err
 
 	wg.Wait()
 
-	if successCount >= r.quorum {
-		lock.expiry = time.Now().Add(ttl)
+	validityTime := r.validityDuration(startTime, ttl)
+	if successCount >= r.quorum && validityTime > 0 {
+		lock.setExpiry(time.Now().Add(validityTime))
 		return nil
 	}
 
