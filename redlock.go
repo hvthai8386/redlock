@@ -158,7 +158,9 @@ func (r *Redlock) tryAcquire(ctx context.Context, key, value string, ttl time.Du
 	}
 
 	// Failed to acquire quorum - release any locks we did get
-	_ = r.releaseAll(ctx, key, value)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = r.releaseAll(cleanupCtx, key, value)
 	return nil, ErrLockNotAcquired
 }
 
