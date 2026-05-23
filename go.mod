@@ -1,0 +1,10 @@
+module github.com/hvthai8386/redlock
+
+go 1.25.8
+
+require github.com/redis/go-redis/v9 v9.19.0
+
+require (
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
+)
